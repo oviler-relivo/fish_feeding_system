@@ -1,4 +1,4 @@
 # fish_feeding_system
-An intelligent aquarium feeding system based on YOLOv5 and STM32.
+基于YOLOv5、STM32、MQTT、MySQL的按需投喂鱼缸管理系统
 # feeding_decision_module
 智能水族投喂系统的投喂决策模块核心代码。
