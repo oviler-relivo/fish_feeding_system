@@ -1,0 +1,350 @@
+# ========== 智能闭环投喂参数 ==========
+# 本轮投喂最大总量
+MAX_TOTAL_FEED_GRAMS = 3.0
+# 预投喂量
+PRE_FEED_GRAMS = 0.5
+# 高 / 中档追加投喂量
+HIGH_FEED_GRAMS = 1.0
+MEDIUM_FEED_GRAMS = 0.5
+# 每次YOLO观察窗口
+OBSERVATION_SECONDS = 10.0
+# 整轮投喂最长持续时间
+MAX_FEED_DURATION = 5 * 60
+# 水泵残饵清理参数：每次运行10秒，累计最多30秒
+PUMP_RUN_SECONDS = 10.0
+PUMP_MAX_RUNTIME = 30.0
+# vR：残饵消耗速度
+VR_HIGH_THRESHOLD = 1.0
+VR_LOW_THRESHOLD = 0.333
+# MDC：数值越小表示鱼群越集中
+# < 100       → 高
+# 100~119.99  → 中
+# >= 120      → 低
+MDC_HIGH_THRESHOLD = 100.0
+MDC_LOW_THRESHOLD = 120.0
+# ANND：数值越小表示鱼群越集中
+# < 80        → 高
+# 80~99.99    → 中
+# >= 100      → 低
+ANND_HIGH_THRESHOLD = 80.0
+ANND_LOW_THRESHOLD = 100.0
+# ===== 克数→步数转换函数 =====
+def grams_to_steps(grams):
+    if grams <= 0:
+        return 0
+    # 基于线性拟合结果
+    steps = (grams - 0.06793) / 3.62886e-4
+    return max(1, round(steps))
+# ======= 指标检测 =======
+# 残饵数量
+def get_residual_count(det):
+    if det is None or len(det) == 0:
+        return 0
+    return sum(
+        1 for d in det
+        if int(d[5]) == RESIDUAL_CLASS_ID
+    )
+
+# 标记鱼检测框中心位置
+def get_fish_centers(det):
+    centers = []
+    if det is None or len(det) == 0:
+        return centers
+    for d in det:
+        if int(d[5]) != FISH_CLASS_ID:
+            continue
+        x1, y1, x2, y2 = [
+            float(v) for v in d[:4]
+        ]
+        centers.append(
+            (
+                (x1 + x2) / 2.0,
+                (y1 + y2) / 2.0
+            )
+        )
+    return centers
+
+# MDC
+def calculate_mdc(fish_centers):
+    if not fish_centers:
+        return None
+    xs = [p[0] for p in fish_centers]
+    ys = [p[1] for p in fish_centers]
+# 计算鱼群自身的几何中心
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+# 计算每条鱼到鱼群自身几何中心的距离
+    distances = [
+        ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+        for x, y in fish_centers
+    ]
+    # 平均距离 = MDC
+    return sum(distances) / len(distances)
+
+# ANND计算
+def calculate_annd(fish_centers):
+    n = len(fish_centers)
+    if n < 2:
+        return None
+    nearest_distances = []
+    for i, (x1, y1) in enumerate(fish_centers):
+        nearest = None
+        for j, (x2, y2) in enumerate(fish_centers):
+            if i == j:
+                continue
+            dx = x1 - x2
+            dy = y1 - y2
+            distance = (dx * dx + dy * dy) ** 0.5
+            if nearest is None or distance < nearest:
+                nearest = distance
+        if nearest is not None:
+            nearest_distances.append(nearest)
+    if not nearest_distances:
+        return None
+    return sum(nearest_distances) / len(nearest_distances)
+
+
+def calculate_instantaneous_rates(samples):
+    rates = []
+    if not samples:
+        return rates
+    # 按1秒划分10秒观察窗口
+    start_time = samples[0]["time"]
+    residual_groups = [[] for _ in range(10)]
+    mdc_groups = [[] for _ in range(10)]
+    annd_groups = [[] for _ in range(10)]
+    for sample in samples:
+        elapsed = sample["time"] - start_time
+        if elapsed < 0 or elapsed >= 10.0:
+            continue
+        second_index = int(elapsed)
+        if not (0 <= second_index < 10):
+            continue
+        # 残饵
+        residual = sample.get("residual")
+        if residual is not None:
+            residual_groups[second_index].append(
+                residual
+            )
+
+        # MDC
+        mdc = sample.get("mdc")
+        if mdc is not None:
+            mdc_groups[second_index].append(
+                mdc
+            )
+        # ANND
+        annd = sample.get("annd")
+        if annd is not None:
+            annd_groups[second_index].append(
+                annd
+            )
+    # 每秒取中位数
+    def calculate_median(values):
+        if not values:
+            return None
+        values = sorted(values)
+        n = len(values)
+        if n % 2 == 1:
+            return values[n // 2]
+        return (
+            values[n // 2 - 1] +
+            values[n // 2]
+        ) / 2.0
+    # 生成10个每秒代表值
+    residual_values = []
+    mdc_values = []
+    annd_values = []
+    for i in range(10):
+        representative_time = i + 0.5
+        residual_median = calculate_median(
+            residual_groups[i]
+        )
+        mdc_median = calculate_median(
+            mdc_groups[i]
+        )
+        annd_median = calculate_median(
+            annd_groups[i]
+        )
+        if residual_median is not None:
+            residual_values.append({
+                "time": representative_time,
+                "value": residual_median
+            })
+        if mdc_median is not None:
+            mdc_values.append(
+                mdc_median
+            )
+        if annd_median is not None:
+            annd_values.append(
+                annd_median
+            )
+    # 计算10秒内10个每秒代表值的最终中位数
+    mdc_median_10s = calculate_median(mdc_values)
+    annd_median_10s = calculate_median(annd_values)
+    # 对残饵进行线性拟合
+    def calculate_slope(values):
+    # 对每秒残饵代表值进行最小二乘线性拟合。
+    # 返回变化斜率。
+        if len(values) < 5:
+            return None
+        x_values = [
+            item["time"]
+            for item in values
+        ]
+        y_values = [
+            item["value"]
+            for item in values
+        ]
+        x_mean = sum(x_values) / len(x_values)
+        y_mean = sum(y_values) / len(y_values)
+        denominator = sum(
+            (x - x_mean) ** 2
+            for x in x_values
+        )
+        if denominator <= 0:
+            return None
+        slope = sum(
+            (x - x_mean) * (y - y_mean)
+            for x, y in zip(x_values, y_values)
+        ) / denominator
+        return slope
+    # 计算残饵消耗速度 vR
+    residual_slope = calculate_slope(
+        residual_values
+    )
+    # 残饵数量下降时斜率为负
+    # vR取负号，使残饵消耗越快，vR越大
+    if residual_slope is None:
+        vr = 0.0
+    else:
+        vr = max(
+            0.0,
+            -residual_slope
+        )
+    for sample in samples:
+        rates.append({
+            "time": sample["time"],
+            "vR": vr,
+            "MDC": mdc_median_10s,
+            "ANND": annd_median_10s,
+            "mdc_values": mdc_values,
+            "annd_values": annd_values
+        })
+    return rates
+def classify_metric(value, high_threshold, low_threshold, reverse=False):
+    # 单个指标进行高中低分类。
+    if reverse:
+        if value < high_threshold:
+            return "high"
+        if value < low_threshold:
+            return "medium"
+        return "low"
+    else:
+        if value >= high_threshold:
+            return "high"
+        if value <= low_threshold:
+            return "low"
+        return "medium"
+def classify_by_50_percent(values, high_threshold, low_threshold):
+    """
+    修改：
+
+    对10秒内得到的每秒MDC/ANND中位数进行高中低判断。
+
+    规则：
+        至少50%的数据满足高条件 → 高
+        否则至少50%的数据满足中条件 → 中
+        否则 → 低
+
+    对于10个数据：
+        5个或以上满足条件即可成立。
+    """
+    if not values:
+        return "low"
+    total = len(values)
+    required_count = total * 0.5
+    high_count = sum(
+        1 for value in values
+        if value < high_threshold
+    )
+    medium_count = sum(
+        1 for value in values
+        if high_threshold <= value < low_threshold
+    )
+    if high_count >= required_count:
+        return "high"
+    if medium_count >= required_count:
+        return "medium"
+    return "low"
+def decide_feed_amount(vr, mdc_values, annd_values):
+    """
+    根据vR、MDC、ANND的高中低状态进行加权评分。
+
+    高 = 2分
+    中 = 1分
+    低 = 0分
+
+    权重：
+        vR   = 0.6
+        MDC  = 0.2
+        ANND = 0.2
+    """
+    # 各指标高中低阈值
+    # vR
+    VR_HIGH_THRESHOLD = 1.0
+    VR_LOW_THRESHOLD = 0.333
+    # MDC
+    MDC_HIGH_THRESHOLD = 100.0
+    MDC_LOW_THRESHOLD = 120.0
+    # ANND
+    ANND_HIGH_THRESHOLD = 80.0
+    ANND_LOW_THRESHOLD = 100.0
+    # 三个指标分类
+    state_r = classify_metric(
+        vr,
+        VR_HIGH_THRESHOLD,
+        VR_LOW_THRESHOLD
+    )
+    state_mdc = classify_by_50_percent(
+        mdc_values,
+        MDC_HIGH_THRESHOLD,
+        MDC_LOW_THRESHOLD
+    )
+    state_annd = classify_by_50_percent(
+        annd_values,
+        ANND_HIGH_THRESHOLD,
+        ANND_LOW_THRESHOLD
+    )
+    # 高 / 中 / 低 → 2 / 1 / 0
+    score_map = {
+        "high": 2,
+        "medium": 1,
+        "low": 0
+    }
+    score_r = score_map[state_r]
+    score_mdc = score_map[state_mdc]
+    score_annd = score_map[state_annd]
+    # 加权评分
+    score = (
+        0.6 * score_r +
+        0.2 * score_mdc +
+        0.2 * score_annd
+    )
+    # 根据总分决定投喂量
+    if score >= 1.4:
+        feed_amount = HIGH_FEED_GRAMS
+
+    elif score >= 0.7:
+        feed_amount = MEDIUM_FEED_GRAMS
+
+    else:
+        feed_amount = 0.0
+    states = {
+        "vR": state_r,
+        "MDC": state_mdc,
+        "ANND": state_annd,
+        "score": score
+    }
+   # 输出指标和下一轮投喂量
+    return feed_amount, states
